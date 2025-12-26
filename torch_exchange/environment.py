@@ -69,9 +69,13 @@ class TorchExecutionEnv(gym.Env):
         self.book_depth = book_depth
         self.trader_unique_id = -9000 + 1
         
-        # Initial Price for Mock Data
-        self.init_price = 1000
+        # Initial Price for Mock Data (e.g. $100.00 in cents)
+        self.init_price = 100000
         self.arrival_mid_price = self.init_price
+        
+        # Normalization Factor: Total Portfolio Value
+        # Reward = 1.0 means perfect execution at arrival price
+        self.initial_value = self.task_size * self.init_price
 
     def reset(self):
         # Initialize Order Book State
@@ -135,24 +139,13 @@ class TorchExecutionEnv(gym.Env):
         if best_bid_price == -1: best_bid_price = self.init_price - 100
         if best_ask_price == MAX_INT: best_ask_price = self.init_price + 100
 
-        # Define Price Levels logic from exec_env.py
+        # Define Price Levels logic
         # FT = Far Touch
         # M = Mid
         # NT = Near Touch
         # PP = Passive
         
-        if self.task == 'sell':
-            # Sell prices are typically Ask side or matching Bids
-            # exec_env logic:
-            # FT = best_bid
-            # M = (best_bid + best_ask) // 2
-            # NT = best_ask
-            # PP = best_ask + ticks
-            
             # Determine target price levels based on n_actions
-            # Previous Hardcoded: [FT, M, NT, PP] (4 levels)
-            # Dynamic: Generate n_actions levels.
-            # Strategy:
             # Level 0: Far Touch (Aggressive) -> Crossing the spread (Best Bid for Sell)
             # Level 1: Mid Price
             # Level 2...N: Near Touch (Passive) + increments (Best Ask + k*tick for Sell)
@@ -206,13 +199,9 @@ class TorchExecutionEnv(gym.Env):
              
         # Clip to task size
         remaining_task = self.task_to_execute - self.quant_executed
-        # Basic trimming logic (simplification)
-        total_q = torch.sum(quants)
         if total_q > remaining_task:
             scale = remaining_task / total_q
-            # quants = (quants * scale).int()
-            # Ensure at least 1 if scale > 0 but int() floors it? 
-            # Simple approach: Loop and set max
+            # Clip quantities to match remaining task
             quants = (quants * scale).int()
 
         # Track execution for this step
@@ -283,22 +272,21 @@ class TorchExecutionEnv(gym.Env):
             
             cost = slippage
             
-        # Reward
-        # Pure Revenue maximization (or Cost Minimization)
-        # Reward = Revenue Improvement vs Arrival?
-        # Standard: VWAP or Arrival Price.
-        # Let's use: Reward = -Slippage (maximize negative slippage)
-        # Or simple: Reward = Revenue (for Sell)
-        
-        if self.task == 'sell':
-            reward = float(step_revenue)
-        else:
-            reward = float(step_revenue) # (negative cost)
-            
-        # Add a penalty for not finishing?
+        # Reward: Implementation Shortfall / Value Realized
+        # Normalize by Initial Value to get decent scale [0, 1]
+        # e.g. If we sell everything at init_price, reward sum = 1.0
+        reward = float(step_revenue) / self.initial_value
+        # Penalty for not finishing
         if done and self.quant_executed < self.task_size:
-            penalty = (self.task_size - self.quant_executed) * self.init_price * 0.1
-            reward -= float(penalty) # Big penalty, scaled
+            # Penalty is the remaining value
+            # Assuming we "lost" the rest (or sold at 0 / bought at infinity)
+            # Let's say we value remaining inventory at 0 (max loss)
+            # Penalty = (Remaining Q * Price) / Initial Value
+            
+            # Simple hefty penalty: 
+            rem_value = (self.task_size - self.quant_executed) * self.init_price
+            penalty = rem_value / self.initial_value
+            reward -= penalty # Effectively subtracting the un-realized value
         
         info = {
             'quant_executed': self.quant_executed,

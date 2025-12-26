@@ -58,35 +58,6 @@ class ActorCritic(nn.Module):
         
         return action, action_log_probs, dist_entropy, value
 
-class RunningMeanStd:
-    def __init__(self, epsilon=1e-4, shape=()):
-        self.mean = np.zeros(shape, 'float64')
-        self.var = np.ones(shape, 'float64')
-        self.count = epsilon
-
-    def update(self, x):
-        batch_mean = np.mean(x, axis=0)
-        batch_var = np.var(x, axis=0)
-        batch_count = x.shape[0]
-        self.update_from_moments(batch_mean, batch_var, batch_count)
-
-    def update_from_moments(self, batch_mean, batch_var, batch_count):
-        self.mean, self.var, self.count = self.update_mean_var_count_from_moments(
-            self.mean, self.var, self.count, batch_mean, batch_var, batch_count)
-
-    def update_mean_var_count_from_moments(self, mean, var, count, batch_mean, batch_var, batch_count):
-        delta = batch_mean - mean
-        tot_count = count + batch_count
-
-        new_mean = mean + delta * batch_count / tot_count
-        m_a = var * count
-        m_b = batch_var * batch_count
-        M2 = m_a + m_b + np.square(delta) * count * batch_count / tot_count
-        new_var = M2 / tot_count
-        new_count = tot_count
-
-        return new_mean, new_var, new_count
-
 class PPOAgent:
     def __init__(self, env, device='cpu', 
                  lr=3e-4, 
@@ -214,28 +185,10 @@ class PPOAgent:
             b_dones = torch.tensor(dones_buf, device=self.device).float()
             b_values = torch.cat(values_buf).squeeze()
             
-            # --- Robust Reward Normalization (Running Mean/Std) ---
-            # We update the running statistics using the batch of rewards
-            # But usually for PPO we want to normalize the *Returns*, but neutralizing rewards helps.
-            # Simple approach: Divide by running std of rewards.
-            # Note: We do NOT subtract the mean because we want to preserve the sign (profit/loss).
-            # If we subtract mean, a "small loss" looks like a "profit".
-            
-            # Helper to update stats (numpy)
-            rewards_np = np.array(rewards_buf)
-            if not hasattr(self, 'reward_normalizer'):
-                self.reward_normalizer = RunningMeanStd()
-            
-            self.reward_normalizer.update(rewards_np)
-            
-            # Normalize rewards for GAE/Value computation only
-            # Scale = 1 / sqrt(var + epsilon)
-            # We can also clip to reasonable range [-10, 10]
-            std = np.sqrt(self.reward_normalizer.var)
-            b_rewards = b_rewards / (torch.tensor(std, device=self.device, dtype=torch.float32) + 1e-8)
-            
-            # For logging, we still have the raw 'batch_rewards' list calculation from above.
-            
+            # --- Reward Normalization ---
+            # Now handled fundamentally by the Environment (Scaling by Initial Value).
+            # b_rewards are already in range ~[-1.0, 1.0] or similar.
+            # No extra processing needed here.
             
             for t in reversed(range(batch_size)):
                 if t == batch_size - 1:

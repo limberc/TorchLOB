@@ -2,7 +2,7 @@
 
 **PyTorchLOB** is a PyTorch-based implementation of a Limit Order Book (LOB) simulator, designed for high-performance Reinforcement Learning (RL) in financial trading. It supports GPU acceleration, including **Mac MPS (Metal Performance Shaders)** for Apple Silicon and CUDA for NVIDIA GPUs.
 
-> **Acknowledgement**: This project is natively based on and inspired by **[JAX-LOB](https://github.com/KangOxford/jax-lob)**. We acknowledge the original authors (Sascha Frey, Kang Li, et al.) for their pioneering work in accelerating LOB simulations.
+
 
 ## Key Features
 
@@ -90,9 +90,9 @@ agent = PPOAgent(
 agent.train(total_timesteps=50000)
 ```
 
-## Citation
+## Acknowledgement
 
-If you use this work or the original logic, please cite the original JAX-LOB paper:
+> This project is heavily modified from **[JAX-LOB](https://github.com/KangOxford/jax-lob)**. We acknowledge the original authors (Sascha Frey, Kang Li, et al. 2023) for their pioneering work in accelerating LOB simulations.
 
 ```
 @misc{frey2023jaxlob,

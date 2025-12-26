@@ -114,7 +114,9 @@ class PPOAgent:
         last_loss = 0.0
         
         # Prepare initial observation once
-        obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        # Prepare initial observation once
+        obs, _ = self.env.reset()
+        obs = obs.unsqueeze(0)
 
         while global_step < total_timesteps:
             # 1. Collect Rollout            
@@ -126,30 +128,40 @@ class PPOAgent:
                 with torch.no_grad():
                     action, logprob, _, value = self.network.get_action_and_value(obs)
                 
-                action_np = action.cpu().numpy().flatten()
-                action_exec = np.abs(action_np).astype(np.int32)
+                # Pure PyTorch Action Processing
+                # action output from normal dist is float. Env expects int quantities.
+                # Take abs() and cast to int.
+                action_exec = torch.abs(action).int().flatten()
                 
-                next_obs, reward, done, info = self.env.step(action_exec)
+                next_obs, reward, terminated, truncated, info = self.env.step(action_exec)
+                done = terminated or truncated
                 
                 cost = info.get('cost', 0.0)
                 
                 # Update temporary metrics
-                if isinstance(reward, torch.Tensor): reward = reward.item()
-                if isinstance(cost, torch.Tensor): cost = cost.item()
+                # Keep as floats for fast python sum/mean or use tensor accumulation?
+                # Using item() here is a sync point but minimal for scalar rewards.
+                if isinstance(reward, torch.Tensor): r_val = reward.item()
+                else: r_val = reward
                 
-                batch_rewards.append(reward)
-                batch_costs.append(cost)
+                if isinstance(cost, torch.Tensor): c_val = cost.item()
+                else: c_val = cost
                 
-                # Store raw reward (normalization happens later or via running stat)
+                batch_rewards.append(r_val)
+                batch_costs.append(c_val)
+                
+                # Store raw reward 
                 obs_buf.append(obs)
                 actions_buf.append(action)
                 logprobs_buf.append(logprob)
-                rewards_buf.append(reward) 
-                costs_buf.append(cost)
+                rewards_buf.append(r_val) 
+                costs_buf.append(c_val)
                 dones_buf.append(done)
                 values_buf.append(value)
                 
-                obs = torch.tensor(next_obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+                # next_obs is now a Tensor from env
+                obs = next_obs.unsqueeze(0)
+                
                 global_step += 1
                 pbar.update(1)
                 
@@ -164,8 +176,9 @@ class PPOAgent:
                     })
                 
                 if done:
-                    obs = self.env.reset()
-                    obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+                    obs, _ = self.env.reset()
+                    # Reset returns tensor now
+                    obs = obs.unsqueeze(0)
 
             # 2. Compute Advantages
             with torch.no_grad():

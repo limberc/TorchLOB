@@ -1,81 +1,97 @@
 import torch
-import sys
+from typing import Tuple, List
 
 # Constants
 INITID = -9000
 MAX_INT = 2_147_483_647
 
-def init_orderside(nOrders=100, device='cpu'):
+def init_orderside(nOrders: int = 100, device: torch.device = torch.device('cpu')) -> torch.Tensor:
     return (torch.ones((nOrders, 6), dtype=torch.int32, device=device) * -1)
 
-def add_order(orderside, msg):
+@torch.jit.script
+def _removeZeroNegQuant(orderside: torch.Tensor) -> torch.Tensor:
+    # Set orders with quantity <= 0 to -1 (empty)
+    # Col 1 is Quantity
+    mask = orderside[:, 1] <= 0
+    # We must only zero out existing orders, not already empty ones (though setting -1 to -1 is fine)
+    # orderside[mask] = -1 # This works in PyTorch
+    if mask.any():
+        orderside.masked_fill_(mask.unsqueeze(1), -1)
+    return orderside
+
+@torch.jit.script
+def add_order(orderside: torch.Tensor, 
+              price: int, 
+              quantity: int, 
+              orderid: int, 
+              traderid: int, 
+              time: int) -> torch.Tensor:
     """
     Adds an order to the orderside.
-    msg: dict/object with keys: price, quantity, orderid, traderid, time, time_ns
+    Arguments provided as scalars/ints, will be converted to tensor inside if needed or just placed.
     """
     # Find first empty slot (where price == -1)
-    # orderside shape: (N, 6) -> price, quantity, orderid, traderid, time, time_ns
+    # Note: nonzero() or where() is sync on CPU, async on GPU but returns tensor.
+    # orderside shape: (N, 6)
     
-    # Check for empty slots
     empty_indices = torch.where(orderside[:, 0] == -1)[0]
     
     if len(empty_indices) == 0:
-        # No space left, currently ignoring or could resize (fixed size in JAX)
         return orderside
         
     idx = empty_indices[0]
     
-    new_order = torch.tensor([
-        msg['price'],
-        max(0, msg['quantity']),
-        msg['orderid'],
-        msg['traderid'],
-        msg['time'],
-        msg['time_ns']
-    ], dtype=torch.int32, device=orderside.device)
+    # Assign values directly
+    orderside[idx, 0] = price
+    orderside[idx, 1] = max(0, quantity)
+    orderside[idx, 2] = orderid
+    orderside[idx, 3] = traderid
+    orderside[idx, 4] = time
+    orderside[idx, 5] = 0 # time_ns unused
     
-    orderside[idx] = new_order
     return _removeZeroNegQuant(orderside)
 
-def _removeZeroNegQuant(orderside):
-    # Set orders with quantity <= 0 to -1 (empty)
-    mask = orderside[:, 1] <= 0
-    orderside[mask] = -1
-    return orderside
-
-def cancel_order(orderside, msg):
+@torch.jit.script
+def cancel_order(orderside: torch.Tensor, 
+                 orderid: int, 
+                 quantity: int, 
+                 price: int) -> torch.Tensor:
     """
-    Cancels quantity from an order.
+    Cancels quantity from an order. (Legacy JAX logic)
     """
-    # Find order by orderid
-    # msg keys: orderid, quantity, price (optional for lookup)
-    
+    INITID = -9000
     # Priority 1: Match by orderid
-    matches = torch.where(orderside[:, 2] == msg['orderid'])[0]
+    matches = torch.where(orderside[:, 2] == orderid)[0]
     
     if len(matches) == 0:
-        # Priority 2: Match by price and INITID checks (legacy logic from JAX)
-        # init_id_match = ((orderside[:, 0] == msg['price']) & (orderside[:, 2] <= INITID))
-        matches = torch.where((orderside[:, 0] == msg['price']) & (orderside[:, 2] <= INITID))[0]
+        # Priority 2: Match by price and INITID checks
+        matches = torch.where((orderside[:, 0] == price) & (orderside[:, 2] <= INITID))[0]
     
     if len(matches) > 0:
         idx = matches[0]
-        orderside[idx, 1] -= msg['quantity']
+        # In-place subtraction
+        orderside[idx, 1] -= quantity
         
     return _removeZeroNegQuant(orderside)
 
-def match_order(data_tuple):
+@torch.jit.script
+def match_order(orderside: torch.Tensor, 
+                qtm: int, 
+                price: int, 
+                trade: torch.Tensor, 
+                agrOID: int, 
+                time: int,
+                top_order_idx: int) -> Tuple[torch.Tensor, int, int, torch.Tensor, int, int]:
     """
     Core matching logic.
-    data_tuple: (top_order_idx, orderside, qtm, price, trade, agrOID, time, time_ns)
+    Returns: (orderside, qtm_remaining, price, trade, agrOID, time)
     """
-    top_order_idx, orderside, qtm, price, trade, agrOID, time, time_ns = data_tuple
     
     # Current order quantity
     current_quant = orderside[top_order_idx, 1]
     
     # Quantity to match is min(available, requested)
-    match_quant = min(current_quant, qtm)
+    match_quant = min(int(current_quant.item()), qtm)
     
     # Update order quantity
     new_quant = current_quant - match_quant
@@ -90,164 +106,209 @@ def match_order(data_tuple):
     if len(empty_indices) > 0:
         trade_idx = empty_indices[0]
         # trade format: price, quantity, passiveOID, agrOID, time, time_ns
-        trade_entry = torch.tensor([
-            orderside[top_order_idx, 0], # Price
-            match_quant,                 # Quantity Executed
-            orderside[top_order_idx, 2], # Passive Order ID
-            agrOID,                      # Aggressor Order ID
-            time,
-            time_ns
-        ], dtype=torch.int32, device=trade.device)
-        trade[trade_idx] = trade_entry
+        # We assign element by element to avoid creating a new tensor
+        trade[trade_idx, 0] = int(orderside[top_order_idx, 0].item())
+        trade[trade_idx, 1] = match_quant
+        trade[trade_idx, 2] = int(orderside[top_order_idx, 2].item())
+        trade[trade_idx, 3] = agrOID
+        trade[trade_idx, 4] = time
+        trade[trade_idx, 5] = 0
         
     orderside = _removeZeroNegQuant(orderside)
-    
-    return (orderside, qtm_remaining, price, trade, agrOID, time, time_ns)
 
-def get_best_bid_idx(orderside):
-    # Highest price. If multiple, lowest time (FIFO).
-    # prices = orderside[:, 0]
-    # valid_mask = prices != -1
+    # The return type of match_order is Tuple[torch.Tensor, int, int, torch.Tensor, int, int]
+    # The original return statement was commented out.
+    # Assuming the function should return the updated orderside and other values.
+    return orderside, qtm_remaining, price, trade, agrOID, time
+
+@torch.jit.script
+def get_best_bid_idx(orderside: torch.Tensor) -> int:
+    price_col = orderside[:, 0]
+    # Filter valid
+    # valid_indices = torch.where(price_col != -1)[0]
+    # JIT optimized max
     
-    # Filter valid orders
-    valid_indices = torch.where(orderside[:, 0] != -1)[0]
-    if len(valid_indices) == 0:
+    # We want max price.
+    # Empty slots are -1. 
+    # If all -1, max is -1
+    
+    val, idx = torch.max(price_col, 0)
+    if val.item() == -1:
+        return -1
+    return int(idx.item())
+
+@torch.jit.script
+def get_best_ask_idx(orderside: torch.Tensor) -> int:
+    MAX_INT = 2_147_483_647
+    price_col = orderside[:, 0]
+    
+    # We want min price.
+    # Empty slots are -1. We should ignore them.
+    # Replace -1 with MAX_INT
+    
+    # temp_prices = torch.where(price_col != -1, price_col, torch.tensor(MAX_INT, dtype=torch.int32, device=orderside.device))
+    # Optimize: 
+    valid_mask = price_col != -1
+    if not valid_mask.any():
         return -1
         
-    valid_orders = orderside[valid_indices]
-    max_price = torch.max(valid_orders[:, 0])
+    temp_prices = torch.where(valid_mask, price_col, torch.tensor(MAX_INT, dtype=torch.int32, device=orderside.device))
     
-    # Candidates with max price
-    best_price_indices = valid_indices[torch.where(valid_orders[:, 0] == max_price)[0]]
+    val, idx = torch.min(temp_prices, 0)
     
-    # Among those, find min time_s
-    best_pricing_orders = orderside[best_price_indices]
-    min_time_s = torch.min(best_pricing_orders[:, 4])
-    
-    time_s_indices = best_price_indices[torch.where(best_pricing_orders[:, 4] == min_time_s)[0]]
-    
-    # Among those, find min time_ns
-    time_s_orders = orderside[time_s_indices]
-    min_time_ns = torch.min(time_s_orders[:, 5])
-    
-    final_indices = time_s_indices[torch.where(time_s_orders[:, 5] == min_time_ns)[0]]
-    
-    return final_indices[0].item()
-
-def get_best_ask_idx(orderside):
-    # Lowest price. If multiple, lowest time (FIFO).
-    valid_indices = torch.where(orderside[:, 0] != -1)[0]
-    if len(valid_indices) == 0:
+    if val.item() == MAX_INT:
         return -1
         
-    valid_orders = orderside[valid_indices]
-    min_price = torch.min(valid_orders[:, 0])
-    
-    # Candidates with min price
-    best_price_indices = valid_indices[torch.where(valid_orders[:, 0] == min_price)[0]]
-    
-    # Among those, find min time_s
-    best_pricing_orders = orderside[best_price_indices]
-    min_time_s = torch.min(best_pricing_orders[:, 4])
-    
-    time_s_indices = best_price_indices[torch.where(best_pricing_orders[:, 4] == min_time_s)[0]]
-    
-    # Among those, find min time_ns
-    time_s_orders = orderside[time_s_indices]
-    min_time_ns = torch.min(time_s_orders[:, 5])
-    
-    final_indices = time_s_indices[torch.where(time_s_orders[:, 5] == min_time_ns)[0]]
-    
-    return final_indices[0].item()
+    return int(idx.item())
 
-def get_best_bid_and_ask_inclQuants(asks, bids):
-    best_ask_idx = get_best_ask_idx(asks)
-    best_bid_idx = get_best_bid_idx(bids)
+@torch.jit.script
+def get_best_bid_and_ask_inclQuants(ask_orders: torch.Tensor, bid_orders: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    MAX_INT = 2_147_483_647
+    # ASKS
+    ask_prices = ask_orders[:, 0]
+    valid_asks_mask = ask_prices != -1
     
-    if best_ask_idx != -1:
-        best_ask_price = asks[best_ask_idx, 0]
+    if valid_asks_mask.any():
+        # Mask out invalid (-1) by setting to MAX_INT
+        temp_asks = torch.where(valid_asks_mask, ask_prices, torch.tensor(MAX_INT, dtype=torch.int32))
+        best_ask_idx = torch.argmin(temp_asks)
+        
+        best_ask_price = temp_asks[best_ask_idx]
+        
         # Sum quantity at this price
-        best_ask_q = torch.sum(asks[torch.where(asks[:, 0] == best_ask_price)[0], 1])
-    else:
-        best_ask_price = MAX_INT
-        best_ask_q = 0
+        # JIT efficient masking
+        # ask_orders[:, 0] == best_ask_price
+        # ask_orders[:, 1]
         
-    if best_bid_idx != -1:
-        best_bid_price = bids[best_bid_idx, 0]
-        best_bid_q = torch.sum(bids[torch.where(bids[:, 0] == best_bid_price)[0], 1])
+        mask_price = (ask_orders[:, 0] == best_ask_price) & valid_asks_mask
+        best_ask_q = torch.sum(
+            torch.where(mask_price, ask_orders[:, 1], torch.tensor(0, dtype=torch.int32))
+        )
+             
+        # best_ask_price is 0-d tensor, best_ask_q is 0-d tensor
+        # Use stack instead of tensor([...]) to avoid "got Tensor" error
+        best_ask = torch.stack([best_ask_price, best_ask_q]).to(dtype=torch.int32)
     else:
-        best_bid_price = -1 # or 0? JAX sets -1/min but usually 0 for price? JAX code uses min/max logic.
-        # JAX get_best_bid returns max(bids), if empty -1.
-        best_bid_q = 0
-        
-    # JAX returns ints
-    return (torch.tensor([best_ask_price, best_ask_q], dtype=torch.int32, device=asks.device),
-            torch.tensor([best_bid_price, best_bid_q], dtype=torch.int32, device=bids.device))
+        best_ask = torch.tensor([MAX_INT, 0], dtype=torch.int32)
 
-def get_L2_state(asks, bids, n_levels=10):
-    device = asks.device
+    # BIDS
+    bid_prices = bid_orders[:, 0]
+    valid_bids_mask = bid_prices != -1
+    
+    if valid_bids_mask.any():
+        # -1 is invalid, but also small. Max works fine.
+        best_bid_idx = torch.argmax(bid_prices)
+        best_bid_price = bid_prices[best_bid_idx]
+        
+        if best_bid_price == -1: # Should be covered by valid_bids_mask check
+             best_bid = torch.tensor([-1, 0], dtype=torch.int32, device=bid_orders.device)
+        else:
+             mask_price = (bid_orders[:, 0] == best_bid_price) & valid_bids_mask
+             best_bid_q = torch.sum(torch.where(mask_price, bid_orders[:, 1], torch.tensor(0, dtype=torch.int32, device=bid_orders.device)))
+             best_bid = torch.stack([best_bid_price, best_bid_q]).to(dtype=torch.int32)
+    else:
+        best_bid = torch.tensor([-1, 0], dtype=torch.int32, device=bid_orders.device)
+        
+    return best_ask, best_bid
+
+@torch.jit.script
+def get_L2_state(ask_orders: torch.Tensor, bid_orders: torch.Tensor, n_levels: int = 10) -> torch.Tensor:
+    MAX_INT = 2_147_483_647
+    device = ask_orders.device
     
     # Process Bids
-    valid_bids_mask = bids[:, 0] != -1
+    valid_bids_mask = bid_orders[:, 0] != -1
     if valid_bids_mask.any():
-        valid_bids = bids[valid_bids_mask]
+        # JIT workaround: slicing boolean mask might be tricky.
+        # use masked_select?
+        valid_bids = bid_orders[valid_bids_mask]
+        
+        # unique
         unique_bid_prices = torch.unique(valid_bids[:, 0])
         # Sort descending
         unique_bid_prices = torch.sort(unique_bid_prices, descending=True).values
         top_bid_prices = unique_bid_prices[:n_levels]
         
-        bid_quants = []
-        for p in top_bid_prices:
-            q = torch.sum(valid_bids[valid_bids[:, 0] == p, 1])
-            bid_quants.append(q)
+        # We need to construct output tensor.
+        # Loop is acceptable for N=10 in JIT
         
-        # Pad if fewer than n_levels
+        # bid_quants = torch.zeros(n_levels, dtype=torch.int32, device=device)
+        # Using list then stacking is standard
+        bid_quants_list: List[torch.Tensor] = []
+        
+        for i in range(len(top_bid_prices)):
+            p = top_bid_prices[i]
+            # Sum quantity
+            # valid_bids is (M, 6)
+            mask = valid_bids[:, 0] == p
+            # q = torch.sum(valid_bids[mask, 1]) # This slicing might be slow?
+            # masked_select is better?
+            # q = torch.sum(valid_bids[:, 1].masked_select(mask))
+            # simple where
+            q = torch.sum(torch.where(mask, valid_bids[:, 1], torch.tensor(0, device=device, dtype=torch.int32)))
+            bid_quants_list.append(q)
+            
+        # Pad
         padding = n_levels - len(top_bid_prices)
         if padding > 0:
-            top_bid_prices = torch.cat((top_bid_prices, torch.ones(padding, device=device, dtype=torch.int32) * -1))
-            bid_quants.extend([torch.tensor(0, device=device, dtype=torch.int32)] * padding)
-        
-        bid_quants = torch.stack(bid_quants) if isinstance(bid_quants[0], torch.Tensor) else torch.tensor(bid_quants, device=device, dtype=torch.int32)
+            # We need to return Prices AND Quants? 
+            # The original just returned quants?
+            # Wait, get_L2_state typically returns [Price, Quant, Price, Quant...] flattened?
+            # The environment expects 610 floats. 40 of which are L2.
+            # L2 usually [P1, Q1, P2, Q2 ...]
             
+            # Let's check environment usage: obs[:40] = l2_state.float()
+            # So 40 items. 10 levels * 2 (P, Q) * 2 (Bid, Ask) = 40. Yes.
+            
+            # Pad Prices
+            pad_p = torch.ones(padding, device=device, dtype=torch.int32) * -1
+            top_bid_prices = torch.cat((top_bid_prices, pad_p))
+            
+            # Pad Quants
+            for _ in range(padding):
+                bid_quants_list.append(torch.tensor(0, device=device, dtype=torch.int32))
+                
+        # Stack quants
+        bid_quants = torch.stack(bid_quants_list)
+        
     else:
         top_bid_prices = torch.ones(n_levels, device=device, dtype=torch.int32) * -1
         bid_quants = torch.zeros(n_levels, device=device, dtype=torch.int32)
 
     # Process Asks
-    valid_asks_mask = asks[:, 0] != -1
+    valid_asks_mask = ask_orders[:, 0] != -1
     if valid_asks_mask.any():
-        valid_asks = asks[valid_asks_mask]
+        valid_asks = ask_orders[valid_asks_mask]
         unique_ask_prices = torch.unique(valid_asks[:, 0])
-        # Sort ascending
         unique_ask_prices = torch.sort(unique_ask_prices, descending=False).values
         top_ask_prices = unique_ask_prices[:n_levels]
         
-        ask_quants = []
-        for p in top_ask_prices:
-            q = torch.sum(valid_asks[valid_asks[:, 0] == p, 1])
-            ask_quants.append(q)
+        ask_quants_list: List[torch.Tensor] = []
+        
+        for i in range(len(top_ask_prices)):
+            p = top_ask_prices[i]
+            mask = valid_asks[:, 0] == p
+            q = torch.sum(torch.where(mask, valid_asks[:, 1], torch.tensor(0, device=device, dtype=torch.int32)))
+            ask_quants_list.append(q)
             
         padding = n_levels - len(top_ask_prices)
         if padding > 0:
-            # JAX uses MAX_INT or -1 padding logic. Usually L2 data has -1 for empty levels.
-            top_ask_prices = torch.cat((top_ask_prices, torch.ones(padding, device=device, dtype=torch.int32) * -1))
-            ask_quants.extend([torch.tensor(0, device=device, dtype=torch.int32)] * padding)
-            
-        ask_quants = torch.stack(ask_quants) if isinstance(ask_quants[0], torch.Tensor) else torch.tensor(ask_quants, device=device, dtype=torch.int32)
-
+            pad_p = torch.tensor([MAX_INT]*padding, device=device, dtype=torch.int32)
+            top_ask_prices = torch.cat((top_ask_prices, pad_p))
+            for _ in range(padding):
+                ask_quants_list.append(torch.tensor(0, device=device, dtype=torch.int32))
+                
+        ask_quants = torch.stack(ask_quants_list)
     else:
-        top_ask_prices = torch.ones(n_levels, device=device, dtype=torch.int32) * -1
+        top_ask_prices = torch.ones(n_levels, device=device, dtype=torch.int32) * MAX_INT
         ask_quants = torch.zeros(n_levels, device=device, dtype=torch.int32)
-
-    # Combine: [AskPrices, AskQuants, BidPrices, BidQuants] columns
-    # JAX get_L2_state stack(..., axis=1) -> (N, 4) then flatten -> (N*4)
-    # columns: asks[:,0], asks[:,1], bids[:,0], bids[:,1]
+        
+    # Interleave [AskP, AskQ, BidP, BidQ] or [AskP ... BidP ...]? 
+    # Usually: Asks [P, Q, P, Q], Bids [P, Q, P, Q]
+    # Let's stack [Asks, Bids]
     
-    # Make sure we reshape correctly to match (prices, quants)
-    asks_stacked = torch.stack((top_ask_prices, ask_quants), dim=1) # (10, 2)
-    bids_stacked = torch.stack((top_bid_prices, bid_quants), dim=1) # (10, 2)
+    # Asks: 20 elements (10 P, 10 Q)
+    asks_flat = torch.stack((top_ask_prices, ask_quants), dim=1).flatten()
+    bids_flat = torch.stack((top_bid_prices, bid_quants), dim=1).flatten()
     
-    # hstack -> (10, 4) -> flatten -> 40
-    l2_state = torch.hstack((asks_stacked, bids_stacked)).flatten()
-    return l2_state
-
+    return torch.cat((asks_flat, bids_flat))

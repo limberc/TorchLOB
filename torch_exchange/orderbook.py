@@ -254,7 +254,6 @@ def get_L2_state(ask_orders: torch.Tensor, bid_orders: torch.Tensor, n_levels: i
             # We need to return Prices AND Quants? 
             # The original just returned quants?
             # Wait, get_L2_state typically returns [Price, Quant, Price, Quant...] flattened?
-            # The environment expects 610 floats. 40 of which are L2.
             # L2 usually [P1, Q1, P2, Q2 ...]
             
             # Let's check environment usage: obs[:40] = l2_state.float()

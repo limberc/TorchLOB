@@ -1,7 +1,6 @@
 import torch
 import gymnasium as gym
 from gymnasium import spaces
-import numpy as np
 from typing import Dict, Tuple, Optional, List
 from torch_exchange.orderbook import (
     init_orderside, add_order, cancel_order, match_order, 
@@ -31,10 +30,11 @@ class TorchExecutionEnv(gym.Env):
         self.n_ticks_in_book = 2
         
         # Action space
-        self.action_space = spaces.Box(low=0, high=10, shape=(self.n_actions,), dtype=np.int32)
+        self.action_space = spaces.Box(low=0, high=10, shape=(self.n_actions,), dtype=int)
         
         # Observation space
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(610,), dtype=np.float32)
+        obs_dim = book_depth * 4
+        self.observation_space = spaces.Box(low=float('-inf'), high=float('inf'), shape=(obs_dim,), dtype=float)
 
         # Internal State placeholders
         self.state = None
@@ -318,4 +318,4 @@ class TorchExecutionEnv(gym.Env):
 
     def _get_obs(self):
         # Generate L2 state
-        return get_L2_state(self.ask_orders, self.bid_orders, n_levels=10).float()
+        return get_L2_state(self.ask_orders, self.bid_orders, n_levels=self.book_depth).float()

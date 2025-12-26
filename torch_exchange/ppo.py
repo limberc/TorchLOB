@@ -5,6 +5,7 @@ import numpy as np
 from torch.distributions.normal import Normal
 from typing import Tuple, List
 from tqdm import tqdm
+from .models.networks import ActorCritic
 
 # --- Constants & Config ---
 GAMMA = 0.99
@@ -13,54 +14,14 @@ CLIP_EPS = 0.2
 ENT_KEY = 0.01
 VF_COEF = 0.5
 MAX_GRAD_NORM = 0.5
-HIDDEN_DIM = 256
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim, action_dim):
-        super(ActorCritic, self).__init__()
-        
-        self.encoder = nn.Sequential(
-            nn.Linear(obs_dim, HIDDEN_DIM),
-            nn.Tanh(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
-            nn.Tanh()
-        )
-        
-        self.actor_mean = nn.Sequential(
-            nn.Linear(HIDDEN_DIM, action_dim),
-        )
-        
-        self.actor_logstd = nn.Parameter(torch.zeros(1, action_dim))
-        
-        self.critic = nn.Sequential(
-            nn.Linear(HIDDEN_DIM, 1)
-        )
-        
-    def forward(self, x):
-        features = self.encoder(x)
-        return features
-        
-    def get_action_and_value(self, x, action=None):
-        features = self.forward(x)
-        
-        action_mean = self.actor_mean(features)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        
-        probs = Normal(action_mean, action_std)
-        
-        if action is None:
-            action = probs.sample()
-            
-        action_log_probs = probs.log_prob(action).sum(axis=-1)
-        dist_entropy = probs.entropy().sum(axis=-1)
-        value = self.critic(features)
-        
-        return action, action_log_probs, dist_entropy, value
 
 class PPOAgent:
     def __init__(self, env, device='cpu', 
                  lr=3e-4, 
+                 model_type='mlp',
+                 book_depth=10,
+                 n_stack=4,
                  safety_mode='none',  
                  # 'none', 'rcpo', 'ipo', 'pid'
                  cost_limit=0.01,
@@ -68,14 +29,24 @@ class PPOAgent:
                  pid_Kp=0.01, pid_Ki=0.001, pid_Kd=0.0):
         self.env = env
         self.device = device
+        self.model_type = model_type
+        self.book_depth = book_depth
+        self.n_stack = n_stack
         self.safety_mode = safety_mode
         self.cost_limit = cost_limit
         
         # Dimensions
-        obs_dim = env.observation_space.shape[0]
+        raw_obs_dim = env.observation_space.shape[0]
+        
+        if model_type == 'cnn':
+            # Input to network will be stacked
+            obs_dim = raw_obs_dim * n_stack
+        else:
+            obs_dim = raw_obs_dim
+            
         action_dim = env.action_space.shape[0]
         
-        self.network = ActorCritic(obs_dim, action_dim).to(device)
+        self.network = ActorCritic(obs_dim, action_dim, model_type, book_depth, n_stack).to(device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=lr)
         
         # --- Safety Params ---
@@ -116,21 +87,39 @@ class PPOAgent:
         # Prepare initial observation once
         # Prepare initial observation once
         obs, _ = self.env.reset()
-        obs = obs.unsqueeze(0)
+        
+        # Frame Stacking State
+        obs_stack = None
+        if self.model_type == 'cnn':
+            # Stack shape: (n_stack, raw_obs_dim)
+            obs_stack = obs.unsqueeze(0).repeat(self.n_stack, 1)
+        
+        # Helper to get network input
+        def get_net_input(o_stack):
+             if self.model_type == 'cnn':
+                 return o_stack.view(1, -1) # Flatten stack to (1, n_stack*obs)
+             else:
+                 return o_stack.unsqueeze(0) # (1, obs)
 
+        if self.model_type != 'cnn':
+             obs = obs # Just consistent naming
+        
         while global_step < total_timesteps:
             # 1. Collect Rollout            
-            # Temporary buffers for calculating simple averages for the progress bar during collection
             batch_rewards = []
             batch_costs = []
             
             for i in range(batch_size):
-                with torch.no_grad():
-                    action, logprob, _, value = self.network.get_action_and_value(obs)
                 
-                # Pure PyTorch Action Processing
-                # action output from normal dist is float. Env expects int quantities.
-                # Take abs() and cast to int.
+                # Prepare input
+                if self.model_type == 'cnn':
+                    net_input = get_net_input(obs_stack)
+                else:
+                    net_input = get_net_input(obs)
+                
+                with torch.no_grad():
+                    action, logprob, _, value = self.network.get_action_and_value(net_input)
+                
                 action_exec = torch.abs(action).int().flatten()
                 
                 next_obs, reward, terminated, truncated, info = self.env.step(action_exec)
@@ -138,9 +127,7 @@ class PPOAgent:
                 
                 cost = info.get('cost', 0.0)
                 
-                # Update temporary metrics
-                # Keep as floats for fast python sum/mean or use tensor accumulation?
-                # Using item() here is a sync point but minimal for scalar rewards.
+                # Metrics
                 if isinstance(reward, torch.Tensor): r_val = reward.item()
                 else: r_val = reward
                 
@@ -150,8 +137,12 @@ class PPOAgent:
                 batch_rewards.append(r_val)
                 batch_costs.append(c_val)
                 
-                # Store raw reward 
-                obs_buf.append(obs)
+                # Store
+                if self.model_type == 'cnn':
+                     obs_buf.append(net_input.squeeze(0)) # Store flattened stack
+                else:
+                     obs_buf.append(obs)
+                     
                 actions_buf.append(action)
                 logprobs_buf.append(logprob)
                 rewards_buf.append(r_val) 
@@ -159,13 +150,16 @@ class PPOAgent:
                 dones_buf.append(done)
                 values_buf.append(value)
                 
-                # next_obs is now a Tensor from env
-                obs = next_obs.unsqueeze(0)
+                # State Update
+                if self.model_type == 'cnn':
+                    # Shift stack
+                    obs_stack = torch.cat((obs_stack[1:], next_obs.unsqueeze(0)), dim=0)
+                else:
+                    obs = next_obs
                 
                 global_step += 1
                 pbar.update(1)
                 
-                # Update Progress Bar metrics every 100 steps during collection
                 if (i + 1) % 100 == 0:
                      current_avg_reward = np.mean(batch_rewards[-100:])
                      current_avg_cost = np.mean(batch_costs[-100:])
@@ -176,21 +170,41 @@ class PPOAgent:
                     })
                 
                 if done:
-                    obs, _ = self.env.reset()
-                    # Reset returns tensor now
-                    obs = obs.unsqueeze(0)
+                    # Next Value bootstrapping needs correct next_obs
+                    # But we are done, so next value is masked anyway.
+                    # Just define correct bootstrapping state if needed?
+                    # PPO uses next_value for advantage calc at end of batch. 
+                    # If this step is done, nextnonterminal is 0.
+                    
+                    # Reset Env
+                    reset_obs, _ = self.env.reset()
+                    
+                    if self.model_type == 'cnn':
+                        obs_stack = reset_obs.unsqueeze(0).repeat(self.n_stack, 1)
+                    else:
+                        obs = reset_obs
 
             # 2. Compute Advantages
             with torch.no_grad():
-                _, _, _, next_value = self.network.get_action_and_value(obs)
+                # Get next value
+                if self.model_type == 'cnn':
+                     # We need next state stack. 
+                     # If done at last step, obs_stack is already reset. This is tricky for GAE.
+                     # GAE needs V(s_{t+1}).
+                     # If last step was done, next_value is V(s_{initial}), but masked by done=1.
+                     # So it doesn't matter what V is.
+                     # If NOT done, obs_stack is valid s_{t+1}.
+                     next_net_input = get_net_input(obs_stack)
+                else:
+                     next_net_input = get_net_input(obs)
+                     
+                _, _, _, next_value = self.network.get_action_and_value(next_net_input)
                 
             advantages = torch.zeros(batch_size, device=self.device)
             lastgaelam = 0
             
-
-
             # Convert buffers to tensors
-            b_obs = torch.cat(obs_buf)
+            b_obs = torch.stack(obs_buf) # stack list of tensors
             b_actions = torch.cat(actions_buf)
             b_logprobs = torch.cat(logprobs_buf)
             b_rewards = torch.tensor(rewards_buf, device=self.device, dtype=torch.float32)

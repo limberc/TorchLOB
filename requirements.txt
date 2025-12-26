@@ -1,5 +1,5 @@
 torch
-gym
+gymnasium
 numpy
 pandas
 wandb

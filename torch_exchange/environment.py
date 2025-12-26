@@ -8,6 +8,7 @@ from torch_exchange.orderbook import (
     get_best_bid_and_ask_inclQuants, get_L2_state,
     get_best_bid_idx, get_best_ask_idx
 )
+import pdb  
 
 # Constants
 MAX_INT = 2_147_483_647
@@ -67,20 +68,13 @@ class TorchExecutionEnv(gym.Env):
             self.ask_orders = add_order(
                 self.ask_orders,
                 self.init_price + (i + 1) * 100,
-                100,
-                i + 1000,
-                0,
-                0
+                100, i + 1000, 0, 0
             )
-            
             # Add Bid
             self.bid_orders = add_order(
                 self.bid_orders,
                 self.init_price - (i + 1) * 100,
-                100,
-                i + 2000,
-                0,
-                0
+                100, i + 2000, 0, 0
             )
         
         # State tracking
@@ -324,14 +318,4 @@ class TorchExecutionEnv(gym.Env):
 
     def _get_obs(self):
         # Generate L2 state
-        l2_state = get_L2_state(self.ask_orders, self.bid_orders, n_levels=10)
-        
-        # Flatten and pad to 610
-        # l2 state is 40. We need 610. Padded for now.
-        obs = torch.zeros(610, device=self.device)
-        obs[:40] = l2_state.float()
-        
-        # Add high level features (mimic JAX env)
-        obs[400:404] = torch.tensor([self.step_counter, 0, 0, 0], device=self.device) # Dummy
-        
-        return obs # Return Tensor directly (PyTorch-native)
+        return get_L2_state(self.ask_orders, self.bid_orders, n_levels=10).float()

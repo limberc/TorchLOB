@@ -2,8 +2,6 @@
 
 **PyTorchLOB** is a PyTorch-based implementation of a Limit Order Book (LOB) simulator, designed for high-performance Reinforcement Learning (RL) in financial trading. It supports GPU acceleration, including **Mac MPS (Metal Performance Shaders)** for Apple Silicon and CUDA for NVIDIA GPUs.
 
-
-
 ## Key Features
 
 *   **PyTorch Implementation**: Native `torch` tensors for easy integration with standard Deep RL libraries.
@@ -68,6 +66,11 @@ agent.train(total_timesteps=10000)
 ```
 
 ### 2. Using Real Data & Advanced Models
+
+Download the data from [Kaggle](https://www.kaggle.com/datasets/martinsn/high-frequency-crypto-limit-order-book-data).
+
+`kaggle datasets download -d martinsn/high-frequency-crypto-limit-order-book-data`
+
 ```python
 # Create Environment with Real Data
 data_path = 'high-frequency-crypto-limit-order-book-data/BTC_1sec.csv'

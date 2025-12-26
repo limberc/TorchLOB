@@ -1,6 +1,7 @@
 import torch
 import gymnasium as gym
 from gymnasium import spaces
+import pandas as pd
 from typing import Dict, Tuple, Optional, List
 from torch_exchange.orderbook import (
     init_orderside, add_order, cancel_order, match_order, 
@@ -20,7 +21,7 @@ class TorchExecutionEnv(gym.Env):
     metadata = {'render_modes': ['human']}
 
     def __init__(self, task='sell', task_size=5000, device='cpu',
-    slice_time_window=1800, book_depth=10, tick_size=1, init_price=100000):
+    slice_time_window=1800, book_depth=10, tick_size=1, init_price=100000, data_path=None, nrows=10000):
         super(TorchExecutionEnv, self).__init__()
         self.device = device
         self.task = task
@@ -53,29 +54,34 @@ class TorchExecutionEnv(gym.Env):
         
         # Normalization
         self.initial_value = self.task_size * self.init_price
+        
+        # Load Real Data
+        self.data_path = data_path
+        self.price_history = None
+        if data_path is not None:
+            print(f"Loading data from {data_path}...")
+            # Assuming 'midpoint' column exists. If strictly no header, use index 2.
+            # Based on inspection, it has header 'midpoint' or is col 2.
+            # Let's try header inference.
+            try:
+                df = pd.read_csv(data_path, nrows=nrows)
+                if 'midpoint' in df.columns:
+                    prices = df['midpoint'].values
+                else:
+                    # Fallback to column 2
+                    prices = df.iloc[:, 2].values
+            except Exception as e:
+                print(f"Error loading data: {e}. Falling back to random walk.")
+                prices = None
+                
+            if prices is not None:
+                self.price_history = torch.tensor(prices, device=device, dtype=torch.float32)
+                self.init_price = self.price_history[0].item()
+                self.price_len = len(self.price_history)
+                print(f"Loaded {self.price_len} price points.")
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        
-        # Initialize Order Book State
-        self.ask_orders = init_orderside(self.nOrdersPerSide, self.device)
-        self.bid_orders = init_orderside(self.nOrdersPerSide, self.device)
-        self.trades = (torch.ones((self.nTradesLogged, 6), dtype=torch.int32, device=self.device) * -1)
-        
-        # --- Populate Mock LOB ---
-        for i in range(10):
-            # Add Ask
-            self.ask_orders = add_order(
-                self.ask_orders,
-                self.init_price + (i + 1) * 100,
-                100, i + 1000, 0, 0
-            )
-            # Add Bid
-            self.bid_orders = add_order(
-                self.bid_orders,
-                self.init_price - (i + 1) * 100,
-                100, i + 2000, 0, 0
-            )
         
         # State tracking
         self.quant_executed = 0
@@ -85,12 +91,28 @@ class TorchExecutionEnv(gym.Env):
         self.total_revenue = 0
         self.time = 0
         
-        # Track Arrival Mid Price
-        best_ask, best_bid = get_best_bid_and_ask_inclQuants(self.ask_orders, self.bid_orders)
-        if best_ask[0] != MAX_INT and best_bid[0] != -1:
-             self.arrival_mid_price = (best_ask[0] + best_bid[0]) / 2.0
+        # Initialize Order Book State
+        self.ask_orders = init_orderside(self.nOrdersPerSide, self.device)
+        self.bid_orders = init_orderside(self.nOrdersPerSide, self.device)
+        self.trades = (torch.ones((self.nTradesLogged, 6), dtype=torch.int32, device=self.device) * -1)
+        
+        # Reset Price from History
+        if self.price_history is not None:
+             max_start = self.price_len - int(self.sliceTimeWindow) - 100
+             if max_start > 0: self.data_idx = torch.randint(0, max_start, (1,)).item()
+             else: self.data_idx = 0
+             self.arrival_mid_price = self.price_history[self.data_idx].item()
         else:
-             self.arrival_mid_price = self.init_price
+            self.arrival_mid_price = self.init_price
+
+        # Populate LOB
+        self._regenerate_lob()
+        
+        # Track Arrival Mid Price
+        # Re-calculated by _regenerate_lob above, but consistency check
+        # best_ask, best_bid = get_best_bid_and_ask_inclQuants(self.ask_orders, self.bid_orders)
+        # ...
+        # logic removed/superseded by explicit arrival_mid_price
 
         return self._get_obs(), {}
 
@@ -98,14 +120,26 @@ class TorchExecutionEnv(gym.Env):
         """
         action: array of shape (4,) representing quantities to submit at [FT, M, NT, PP] prices.
         """
+        # 0. Update Market State (Data Replay / Drift)
+        if self.price_history is not None:
+             self.data_idx += 1
+             if self.data_idx < self.price_len:
+                 self.arrival_mid_price = self.price_history[self.data_idx].item()
+        else:
+             drift = torch.randn(1).item() * 5
+             self.arrival_mid_price += drift
+             
+        # Regenerate LOB around new Price
+        self._regenerate_lob()
+
         # 1. Determine Prices
         # Get BBO
         best_ask, best_bid = get_best_bid_and_ask_inclQuants(self.ask_orders, self.bid_orders)
         best_ask_price = best_ask[0].item()
         best_bid_price = best_bid[0].item()
         
-        if best_bid_price == -1: best_bid_price = self.init_price - 100
-        if best_ask_price == MAX_INT: best_ask_price = self.init_price + 100
+        if best_bid_price == -1: best_bid_price = self.arrival_mid_price - 100
+        if best_ask_price == MAX_INT: best_ask_price = self.arrival_mid_price + 100
 
         # Define Price Levels logic
         # FT = Far Touch
@@ -254,6 +288,28 @@ class TorchExecutionEnv(gym.Env):
         obs = self._get_obs()
         return obs, reward, terminated, truncated, info
 
+
+    def _regenerate_lob(self):
+        # Clear Books
+        self.ask_orders = init_orderside(self.nOrdersPerSide, self.device)
+        self.bid_orders = init_orderside(self.nOrdersPerSide, self.device)
+        
+        # Re-populate around current arrival_mid_price
+        price = self.arrival_mid_price
+        
+        for i in range(10):
+            # Add Ask
+            self.ask_orders = add_order(
+                self.ask_orders,
+                int(price + (i + 1) * 100),
+                100, i + 1000 + self.step_counter * 100, 0, 0
+            )
+            # Add Bid
+            self.bid_orders = add_order(
+                self.bid_orders,
+                int(price - (i + 1) * 100),
+                100, i + 2000 + self.step_counter * 100, 0, 0
+            )
 
     def _limit_order(self, side, orderside_passive, orderside_active, price, quantity, orderid, traderid, time):
         """

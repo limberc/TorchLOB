@@ -13,8 +13,11 @@ class CNNEncoder(nn.Module):
         # But usually FrameStack is channel dim.
         
         self.net = nn.Sequential(
+            # Important to ALL.
+            nn.LayerNorm(input_w),
             nn.Conv2d(n_stack, 16, kernel_size=(3, 1), padding=(1, 0)),
             nn.ReLU(),
+            nn.LayerNorm(input_w),
             nn.Conv2d(16, 32, kernel_size=(3, 1), padding=(1, 0)),
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=(3, 4), padding=(1, 0)), # Convolve over full width (4 features)

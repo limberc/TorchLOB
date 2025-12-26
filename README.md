@@ -8,15 +8,18 @@
 
 *   **PyTorch Implementation**: Native `torch` tensors for easy integration with standard Deep RL libraries.
 *   **Mac MPS Support**: Optimized to run efficiently on Apple M1/M2/M3 chips using the Metal backend.
+*   **Real Market Data Replay**: Supports loading LOB data (e.g., Crypto CSVs) to drive realistic price dynamics.
+*   **Deep Learning Models**: Includes **CNN (Price-Time)** and **Transformer** architectures for state-of-the-art LOB representation.
 *   **Safe RL Agents**: Includes implementations of **PPO** with **PID-Lagrangian** constraints for safe execution handling (e.g., minimizing slippage).
 *   **Gymnasium Compatible**: Fully compatible `gym.Env` interface (`TorchExecutionEnv`) for easy plugging into standard RL loops.
 
 ## Architecture
 
 *   `torch_exchange`: Core package.
-    *   `orderbook.py`: Vectorized Limit Order Book logic using PyTorch.
-    *   `environment.py`: Gym-compatible Execution Environment.
-    *   `ppo.py`: Customizable PPO Agent with Safe RL (PID-Lagrangian) capabilities.
+    *   `orderbook.py`: Vectorized Limit Order Book logic using PyTorch **JIT Compilation** for maximum speed.
+    *   `environment.py`: Gym-compatible Execution Environment with **Dynamic Observation Spaces**.
+    *   `ppo.py`: Customizable PPO Agent supporting **MLP**, **CNN**, and **Transformer** encoders.
+    *   `models/networks.py`: Neural network definitions.
 
 ## Installation
 
@@ -33,33 +36,58 @@ pip install -r requirements.txt
 
 The best way to get started is to run the demo notebook:
 
+```bash
+demo.ipynb
+```
+
 This notebook demonstrates:
 
 1.  **FIFO Baseline**: A standard passive execution strategy.
-2.  **Safe RL (PPO)**: Training a PPO agent with slippage constraints on the LOB.
+2.  **Real Data Replay**: Loading Bitcoin 1-sec LOB data to simulate realistic market conditions.
+3.  **Safe RL (PPO)**: Training a PPO agent with slippage constraints on the LOB.
 
 ## Usage Example
 
+### 1. Basic Setup
 ```python
 import torch
 from torch_exchange.environment import TorchExecutionEnv
 from torch_exchange.ppo import PPOAgent
 
-# 1. Setup Device (Mac MPS or CUDA)
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+# Setup Device
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-# 2. Create Environment
-# task='sell': Execute a sell order of 5000 units
-env = TorchExecutionEnv(task='sell', task_size=5000, device=device, book_depth=10, tick_size=100)
+# Create Environment (Mock Data)
+env = TorchExecutionEnv(task='sell', task_size=5000, device=device, book_depth=10)
 
-# 3. Initialize Agent
-agent = PPOAgent(env, device=device, lr=3e-4, cost_limit=0.5)
+# Initialize Agent (MLP)
+agent = PPOAgent(env, device=device, lr=3e-4, model_type='mlp')
 
-# 4. Train
+# Train
 agent.train(total_timesteps=10000)
+```
+
+### 2. Using Real Data & Advanced Models
+```python
+# Create Environment with Real Data
+data_path = 'high-frequency-crypto-limit-order-book-data/BTC_1sec.csv'
+env = TorchExecutionEnv(
+    task='sell', 
+    device=device, 
+    data_path=data_path, 
+    nrows=10000
+)
+
+# Initialize Agent with CNN (Frame Stacking)
+agent = PPOAgent(
+    env, 
+    device=device, 
+    model_type='cnn', 
+    n_stack=4 # Stack 4 frames
+)
+
+# Train against real price history
+agent.train(total_timesteps=50000)
 ```
 
 ## Citation
